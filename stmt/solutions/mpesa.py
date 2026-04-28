@@ -2,177 +2,235 @@ import pdfplumber
 from datetime import datetime
 import re
 import pandas as pd
+from typing import Pattern, Union
 
-# --- CONFIGURATION ---
-pdf_path = "../data/MPESA_Statement.pdf"
-output_file = "mpesa_transaction.csv"
+class MpesaStatementExtractor:
+    """
+    Extracts transactions from an MPESA PDF statement
+    and saves them to a CSV file.
 
+    Usage:
+        extractor = MpesaStatementExtractor("../data/MPESA_Statement.pdf", password="543343")
+        extractor.run()
+    """
 
-# ── Helper: convert "2026-04-27 13:11:58" → "27/4/2026" ──────────────────────
-def format_date(date_str):
-    if not date_str:
-        return ""
-    try:
-        # 1. Take only the first part (the date)
-        date_only = date_str.strip().split(" ")[0]
-        # 2. Parse Year-Month-Day
-        date_obj = datetime.strptime(date_only, "%Y-%m-%d")
-        # 3. Return Day/Month/Year
-        return f"{date_obj.day}/{date_obj.month}/{date_obj.year}"
-    except:
-        return date_str
+    def __init__(self, pdf_path, output_file="mpesa_transaction.csv", password=None):
+        self.pdf_path    = pdf_path
+        self.output_file = output_file
+        self.password    = password
+        self.rows        = []   # all rows that will go into the CSV
+        self.i           = 0    # row counter
 
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
 
-# ── Helper: strip commas and convert to float ─────────────────────────────────
-def clean_num(text):
-    if not text or str(text).strip() == "":
-        return 0.0
-    clean = re.sub(r"[^0-9.]", "", str(text))
-    try:
-        return float(clean)
-    except:
-        return 0.0
+    @classmethod
+    def clean_num(self, text):
+        """Turn a string like '1,000.50' into a float like 1000.5"""
+        if not text or str(text).strip() == "":
+            return 0.0
+        clean = re.sub(r"[^0-9.]", "", str(text))
+        try:
+            return float(clean)
+        except:
+            return 0.0
 
+    def format_date(self, date_str):
+        """Convert '2026-04-27 13:11:58' into '27/4/2026'"""
+        if not date_str:
+            return ""
+        try:
+            date_only = date_str.strip().split(" ")[0]
+            date_obj = datetime.strptime(date_only, "%Y-%m-%d")
+            return f"{date_obj.day}/{date_obj.month}/{date_obj.year}"
+        except:
+            return date_str
 
-# ── Helper: search for a pattern, return group(1) or "" if not found ──────────
-def extract(pattern, text, flags=0):
-    match = re.search(pattern, text, flags)
-    return match.group(1).strip() if match else ""
+    def extract(self, pattern: Union[str,Pattern[str]], text:str, flags=0):
+        """Find a pattern in text and return the captured group, or '' if not found"""
+        match = re.search(pattern, text, flags)
+        return match.group(1).strip() if match else ""
 
+    # =========================================================================
+    # STEP 1: EXTRACT METADATA FROM PAGE 1
+    # =========================================================================
 
-rows = []
-with pdfplumber.open(pdf_path, password="543343") as pdf:
-    # Read Page 1 Text
-    page1_text = pdf.pages[0].extract_text() or ""
+    def extract_metadata(self, page1_text):
+        """Read page 1 and return all account info as a dictionary"""
+        customer_name    = self.extract(r"Customer Name:\s*(.+)",    page1_text)
+        mobile_number    = self.extract(r"Mobile Number:\s*(\d+)",   page1_text)
+        email_address    = self.extract(r"Email Address:\s*(\S+)",   page1_text)
+        request_date     = self.extract(r"Request Date:\s*(.+)",     page1_text)
+        statement_period = self.extract(r"Statement Period:\s*(.+)", page1_text)
 
-    print(page1_text)
+        return {
+            "customer_name":    customer_name,
+            "mobile_number":    mobile_number,
+            "email_address":    email_address,
+            "request_date":     request_date,
+            "statement_period": statement_period,
+        }
 
-    # ── 1. EXTRACT HEADER METADATA ───────────────────────────────────────────
-    customer_name = extract(r"Customer Name:\s*(.+)", page1_text)
-    mobile_number = extract(r"Mobile Number:\s*(\d+)", page1_text)
-    email_address = extract(r"Email Address:\s*(\S+)", page1_text)
-    request_date = extract(r"Request Date:\s*(.+)", page1_text)
-    statement_period = extract(r"Statement Period:\s*(.+)", page1_text)
+    # =========================================================================
+    # STEP 2: EXTRACT SUMMARY FROM PAGE 1
+    # =========================================================================
 
-    # ── 2. EXTRACT SUMMARY ───────────────────────────────────────
-    summary_block = extract(r"SUMMARY(.*?)(TOTAL:.*)", page1_text, re.S)
+    def extract_summary(self, page1_text):
+        """
+        Pull out the summary block (e.g. Send Money, Paybill, etc.)
+        and return it as a dictionary of {name: {paid_in, paid_out}}
+        """
+        summary_block = self.extract(r"SUMMARY(.*?)(TOTAL:.*)", page1_text, re.S)
 
-    pattern = r"([A-Z \-\(\)]+):\s*([\d,]+\.\d{2})\s*([\d,]+\.\d{2})"
-    matches = re.findall(pattern, summary_block)
+        pattern = r"([A-Z \-\(\)]+):\s*([\d,]+\.\d{2})\s*([\d,]+\.\d{2})"
+        matches = re.findall(pattern, summary_block)
 
-    summary_data = {}
-    for name, paid_in, paid_out in matches:
-        summary_data[name.strip()] = {"paid_in": paid_in, "paid_out": paid_out}
+        summary_data = {}
+        for name, paid_in, paid_out in matches:
+            summary_data[name.strip()] = {"paid_in": paid_in, "paid_out": paid_out}
 
-    # ── PRINT ───────────────────────────────────────────────────
-    print("\n--- SUMMARY ---")
-    for k, v in summary_data.items():
-        print(f"{k}: In = {v['paid_in']}, Out = {v['paid_out']}")
+        return summary_data
 
-    # ── 3. PRINTING THE RESULTS ──────────────────────────────────────────────
-    print("--- METADATA ---")
-    print(f"Customer Name:   {customer_name}")
-    print(f"Mobile Number:   {mobile_number}")
-    print(f"Email Address:   {email_address}")
-    print(f"Request Date:  {request_date}")
-    print(f"Statement Period: {statement_period}")
+    # =========================================================================
+    # STEP 3: BUILD HEADER AND METADATA ROWS
+    # =========================================================================
 
-    # ── 3. COLUMN HEADER ROW (col A is empty on purpose) ─────────────────────
-    rows.append(
-        [
-            "",
-            "TXN_DATE",
-            "VALUE_DATE",
-            "DESCRIPTION",
-            "MONEY_OUT_OR_IN",
-            "BALANCE",
-            "TXN_TYPE",
+    def build_metadata_rows(self, meta, summary_data):
+        """Write the header row, metadata rows, and summary rows into self.rows"""
+
+        # First header row
+        self.rows.append(["", "TXN_DATE", "VALUE_DATE", "DESCRIPTION", "MONEY_OUT_OR_IN", "BALANCE", "TXN_TYPE"])
+
+        # Put all metadata descriptions in a list then loop through them
+        metadata_descriptions = [
+            "Customer Name: "    + meta["customer_name"],
+            "Mobile Number: "    + meta["mobile_number"],
+            "Email Address: "    + meta["email_address"],
+            "Statement Period: " + meta["statement_period"],
+            "Request Date: "     + meta["request_date"],
         ]
-    )
 
-    # ── 4. METADATA ROWS ───────────────────────────────────────
-    i = 0
+        for description in metadata_descriptions:
+            self.rows.append([self.i, "", "", description, "", "", ""])
+            self.i += 1
 
-    rows.append([i, "", "", f"Customer Name: {customer_name}", "", "", ""])
-    i += 1
-    rows.append([i, "", "", f"Mobile Number: {mobile_number}", "", "", ""])
-    i += 1
-    rows.append([i, "", "", f"Email Address: {email_address}", "", "", ""])
-    i += 1
-    rows.append([i, "", "", f"Statement Period: {statement_period}", "", "", ""])
-    i += 1
-    rows.append([i, "", "", f"Request Date: {request_date}", "", "", ""])
-    i += 1
-    # ── 5. SUMMARY ROWS ───────────────────────────────────────
-    for name, values in summary_data.items():
-        desc = f"{name}: In = {values['paid_in']}, Out = {values['paid_out']}"
-        rows.append([i, "", "", desc, "", "", ""])
-        i += 1
-    # ── 6. SECOND HEADER ROW ──────────────────────────────────
-    rows.append(
-        [
-            i,
-            "TXN_DATE",
-            "VALUE_DATE",
-            "DESCRIPTION",
-            "MONEY_OUT_OR_IN",
-            "BALANCE",
-            "TXN_TYPE",
-        ]
-    )
-    # ── 7. EXTRACT TRANSACTIONS PAGE BY PAGE ─────────────────────────────────
-    i += 1  # continue index after metadata rows
+        # Summary rows — one row per summary category
+        for name, values in summary_data.items():
+            desc = f"{name}: In = {values['paid_in']}, Out = {values['paid_out']}"
+            self.rows.append([self.i, "", "", desc, "", "", ""])
+            self.i += 1
 
-    for page in pdf.pages:
+        # Second header row before transactions
+        self.rows.append([self.i, "TXN_DATE", "VALUE_DATE", "DESCRIPTION", "MONEY_OUT_OR_IN", "BALANCE", "TXN_TYPE"])
+        self.i += 1
+
+    # =========================================================================
+    # STEP 4: EXTRACT TRANSACTIONS FROM ONE PAGE
+    # =========================================================================
+
+    def extract_transactions_from_page(self, page):
+        """
+        Extract all transaction rows from a single PDF page.
+
+        Columns in this PDF:
+          row[0] = Receipt No.
+          row[1] = Completion Time  ← the date
+          row[2] = Details
+          row[3] = Transaction Status
+          row[4] = Paid In           ← Credit
+          row[5] = Withdrawn         ← Debit
+          row[6] = Balance
+        """
         table = page.extract_table({
             "vertical_strategy":   "lines",
             "horizontal_strategy": "lines"
         })
+
         if not table:
-            continue
+            return   # no table on this page, nothing to do
 
         for row in table:
             if not row or len(row) < 7:
                 continue
 
-            # Columns: [Receipt No., Completion Time, Details, Transaction Status, Paid In, Withdrawn, Balance]
-            receipt_no  = (row[0] or "").strip()
-            comp_time   = (row[1] or "").strip()
-            details     = (row[2] or "").strip()
-            status      = (row[3] or "").strip()
-            paid_in     = clean_num(row[4])
-            withdrawn   = clean_num(row[5])
-            balance     = clean_num(row[6])
+            receipt_no = (row[0] or "").strip()
+            comp_time  = (row[1] or "").strip()
+            details    = (row[2] or "").strip()
+            status     = (row[3] or "").strip()
+            paid_in    = self.clean_num(row[4])
+            withdrawn  = self.clean_num(row[5])
+            balance    = self.clean_num(row[6])
 
-            # Skip header rows
+            # Skip header rows — they don't have a date in the date column
             if not re.match(r"\d{4}-\d{2}-\d{2}", comp_time):
                 continue
 
-            # Combine Receipt No + Details + Status into DESCRIPTION
+            # Combine Receipt No + Details + Status into one DESCRIPTION field
             desc_parts = [p for p in [receipt_no, details, status] if p]
-            desc = " | ".join(desc_parts)
+            description = " | ".join(desc_parts)
 
-            # Determine amount and TXN_TYPE
-            # Withdrawn values in PDF appear as negatives e.g. -1300.00
+            # Work out amount and CR/DR
             if paid_in > 0:
                 amount   = paid_in
                 txn_type = "CR"
             else:
-                amount   = withdrawn  # already positive after clean_num strips the minus
+                amount   = withdrawn
                 txn_type = "DR"
 
-            rows.append([
-                i,
-                format_date(comp_time),   # TXN_DATE
-                format_date(comp_time),   # VALUE_DATE (same column in this PDF)
-                desc,
+            self.rows.append([
+                self.i,
+                self.format_date(comp_time),   # TXN_DATE
+                self.format_date(comp_time),   # VALUE_DATE
+                description,
                 amount,
                 balance,
                 txn_type,
             ])
-            i += 1
+            self.i += 1
 
-# ── 8. SAVE ───────────────────────────────────────────────────────────────────
-df = pd.DataFrame(rows)
-df.to_csv(output_file, index=False, header=False)
-print(f"Done — {i} rows written to {output_file}")
+    # =========================================================================
+    # STEP 5: SAVE TO CSV
+    # =========================================================================
+
+    def save(self):
+        """Save all rows in self.rows to a CSV file"""
+        df = pd.DataFrame(self.rows)
+        df.to_csv(self.output_file, index=False, header=False)
+        print(f"Done! Extracted {self.i} rows.")
+        print(f"Saved to: {self.output_file}")
+
+    # =========================================================================
+    # RUN: CALLS ALL STEPS IN ORDER
+    # =========================================================================
+
+    def run(self):
+        """Main method — runs all steps in order"""
+        with pdfplumber.open(self.pdf_path, password=self.password) as pdf:
+
+            # Step 1 & 2: read page 1 and extract metadata + summary
+            page1_text   = pdf.pages[0].extract_text() or ""
+            meta         = self.extract_metadata(page1_text)
+            summary_data = self.extract_summary(page1_text)
+
+            # Step 3: write metadata and summary into self.rows
+            self.build_metadata_rows(meta, summary_data)
+
+            # Step 4: loop every page and extract transactions
+            for page in pdf.pages:
+                self.extract_transactions_from_page(page)
+
+        # Step 5: save everything to CSV
+        self.save()
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+if __name__ == "__main__":
+    extractor = MpesaStatementExtractor(
+        pdf_path    = "../data/MPESA_Statement.pdf",
+        output_file = "mpesa_transaction.csv",
+        password    = "543343"
+    )
+    extractor.run()
